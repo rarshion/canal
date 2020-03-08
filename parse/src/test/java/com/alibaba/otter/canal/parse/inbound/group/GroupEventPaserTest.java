@@ -2,6 +2,7 @@ package com.alibaba.otter.canal.parse.inbound.group;
 
 import java.net.InetSocketAddress;
 
+import org.junit.Ignore;
 import org.junit.Test;
 
 import com.alibaba.otter.canal.parse.exception.CanalParseException;
@@ -23,7 +24,7 @@ public class GroupEventPaserTest {
     private static final String MYSQL_ADDRESS = "127.0.0.1";
     private static final String USERNAME      = "xxxxx";
     private static final String PASSWORD      = "xxxxx";
-
+    @Ignore
     @Test
     public void testMysqlWithMysql() {
         // MemoryEventStoreWithBuffer eventStore = new
@@ -88,8 +89,8 @@ public class GroupEventPaserTest {
     private BinlogParser buildParser(AuthenticationInfo info) {
         return new AbstractBinlogParser<LogEvent>() {
 
-            public Entry parse(LogEvent event) throws CanalParseException {
-                // return _parser.parse(event);
+            @Override
+            public Entry parse(LogEvent event, boolean isSeek) throws CanalParseException {
                 return null;
             }
         };
