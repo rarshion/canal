@@ -5,10 +5,12 @@ import java.io.InterruptedIOException;
 import java.net.SocketTimeoutException;
 import java.nio.channels.ClosedByInterruptException;
 
+import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.alibaba.otter.canal.parse.driver.mysql.socket.SocketChannel;
+import com.alibaba.otter.canal.parse.exception.ServerLogPurgedException;
 import com.taobao.tddl.dbsync.binlog.LogFetcher;
 
 /**
@@ -19,23 +21,30 @@ import com.taobao.tddl.dbsync.binlog.LogFetcher;
  */
 public class DirectLogFetcher extends LogFetcher {
 
-    protected static final Logger logger            = LoggerFactory.getLogger(DirectLogFetcher.class);
+    protected static final Logger logger                          = LoggerFactory.getLogger(DirectLogFetcher.class);
+
+    // Master heartbeat interval
+    public static final int       MASTER_HEARTBEAT_PERIOD_SECONDS = 15;
+    // +10s 确保 timeout > heartbeat interval
+    private static final int      READ_TIMEOUT_MILLISECONDS       = (MASTER_HEARTBEAT_PERIOD_SECONDS + 10) * 1000;
 
     /** Command to dump binlog */
-    public static final byte      COM_BINLOG_DUMP   = 18;
+    public static final byte      COM_BINLOG_DUMP                 = 18;
 
     /** Packet header sizes */
-    public static final int       NET_HEADER_SIZE   = 4;
-    public static final int       SQLSTATE_LENGTH   = 5;
+    public static final int       NET_HEADER_SIZE                 = 4;
+    public static final int       SQLSTATE_LENGTH                 = 5;
 
     /** Packet offsets */
-    public static final int       PACKET_LEN_OFFSET = 0;
-    public static final int       PACKET_SEQ_OFFSET = 3;
+    public static final int       PACKET_LEN_OFFSET               = 0;
+    public static final int       PACKET_SEQ_OFFSET               = 3;
 
     /** Maximum packet length */
-    public static final int       MAX_PACKET_LENGTH = (256 * 256 * 256 - 1);
+    public static final int       MAX_PACKET_LENGTH               = (256 * 256 * 256 - 1);
 
     private SocketChannel         channel;
+
+    private boolean               issemi                          = false;
 
     // private BufferedInputStream input;
 
@@ -53,9 +62,10 @@ public class DirectLogFetcher extends LogFetcher {
 
     public void start(SocketChannel channel) throws IOException {
         this.channel = channel;
-        // 和mysql driver一样，提供buffer机制，提升读取binlog速度
-        // this.input = new
-        // BufferedInputStream(channel.socket().getInputStream(), 16384);
+        String dbsemi = System.getProperty("db.semi");
+        if ("1".equals(dbsemi)) {
+            issemi = true;
+        }
     }
 
     /**
@@ -91,6 +101,13 @@ public class DirectLogFetcher extends LogFetcher {
                     final int errno = getInt16();
                     String sqlstate = forward(1).getFixString(SQLSTATE_LENGTH);
                     String errmsg = getFixString(limit - position);
+                    if (StringUtils.containsIgnoreCase(errmsg, "not find first log file name")
+                        || StringUtils.containsIgnoreCase(errmsg, "purged binary logs")) {
+                        // 开始 dump 后，server 位点过期，DUMP 和 DUMP_GTID 两种错误信息
+                        throw new ServerLogPurgedException(
+                            " errno = " + errno + ", sqlstate = " + sqlstate + " errmsg = " + errmsg);
+                    }
+
                     throw new IOException("Received error packet:" + " errno = " + errno + ", sqlstate = " + sqlstate
                                           + " errmsg = " + errmsg);
                 } else if (mark == 254) {
@@ -104,6 +121,14 @@ public class DirectLogFetcher extends LogFetcher {
                     throw new IOException("Unexpected response " + mark + " while fetching binlog: packet #" + netnum
                                           + ", len = " + netlen);
                 }
+            }
+
+            // if mysql is in semi mode
+            if (issemi) {
+                // parse semi mark
+                int semimark = getUint8(NET_HEADER_SIZE + 1);
+                int semival = getUint8(NET_HEADER_SIZE + 2);
+                this.semival = semival;
             }
 
             // The first packet is a multi-packet, concatenate the packets.
@@ -122,7 +147,11 @@ public class DirectLogFetcher extends LogFetcher {
             }
 
             // Preparing buffer variables to decoding.
-            origin = NET_HEADER_SIZE + 1;
+            if (issemi) {
+                origin = NET_HEADER_SIZE + 3;
+            } else {
+                origin = NET_HEADER_SIZE + 1;
+            }
             position = origin;
             limit -= origin;
             return true;
@@ -130,11 +159,7 @@ public class DirectLogFetcher extends LogFetcher {
             close(); /* Do cleanup */
             logger.error("Socket timeout expired, closing connection", e);
             throw e;
-        } catch (InterruptedIOException e) {
-            close(); /* Do cleanup */
-            logger.info("I/O interrupted while reading from client socket", e);
-            throw e;
-        } catch (ClosedByInterruptException e) {
+        } catch (InterruptedIOException | ClosedByInterruptException e) {
             close(); /* Do cleanup */
             logger.info("I/O interrupted while reading from client socket", e);
             throw e;
@@ -148,10 +173,13 @@ public class DirectLogFetcher extends LogFetcher {
     private final boolean fetch0(final int off, final int len) throws IOException {
         ensureCapacity(off + len);
 
-        byte[] read = channel.read(len);
-        System.arraycopy(read, 0, this.buffer, off, len);
+        // byte[] read = channel.read(len, READ_TIMEOUT_MILLISECONDS);
+        // System.arraycopy(read, 0, this.buffer, off, len);
 
-        if (limit < off + len) limit = off + len;
+        channel.read(buffer, off, len, READ_TIMEOUT_MILLISECONDS);
+        if (limit < off + len) {
+            limit = off + len;
+        }
         return true;
     }
 
